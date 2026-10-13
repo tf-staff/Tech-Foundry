@@ -66,6 +66,7 @@ from controller.controller import (
     TM_MIN_US,
     TRAVEL_MARGIN_MM,
 )
+from gui.sequence_panel import ConditioningControls, SequencePanel
 from program.contour_program import build_contour_program, compute_contour_increments
 from program.current_profile_program import (
     AT_SAMPLES as CURRENT_PROFILE_AT_SAMPLES,
@@ -518,6 +519,9 @@ class App:
             limits_frame, textvariable=self.scale_var, anchor="w",
             justify="left", font=("TkFixedFont", 8),
         ).pack(fill="x", pady=(4, 0))
+        # LVDT mode-2/mode-1 conditioning pulses (handoff notes, section
+        # 4) -- condition to mode 2 BEFORE capturing calibration points.
+        self.conditioning_controls = ConditioningControls(self, limits_frame)
 
         motion_frame = tk.LabelFrame(content, text="Closed Loop Motion")
         motion_frame.pack(padx=10, pady=(0, 10), fill="x")
@@ -827,6 +831,12 @@ class App:
             state="disabled",
         )
         self.current_profile_fire_button.pack(side="left")
+
+        # Full impact sequence built on the Current Profile fields above
+        # (conditioning pulse, dwell, retract, two-segment recording) and
+        # the profile-file hand-off to the user GUI -- see
+        # gui/sequence_panel.py; shares this frame's fields by reference.
+        self.sequence_panel = SequencePanel(self, content)
 
         # Closed-loop trajectory: Arm computes a constant-acceleration
         # contour (0 velocity at Start -> Impact Velocity at Impact Position
@@ -1221,6 +1231,7 @@ class App:
         self.pvt_fire_button.config(state="disabled")
         self.current_profile_fire_button.config(state="disabled")
         self.simple_ol_fire_button.config(state="disabled")
+        self.sequence_panel.set_connected(True)
 
         # connect()'s setup header just re-applied the defaults to the
         # controller -- reset these fields to match, so a value tuned in a
@@ -1274,6 +1285,8 @@ class App:
         self.current_profile_fire_button.config(state="disabled")
         self.simple_ol_load_button.config(state="disabled")
         self.simple_ol_fire_button.config(state="disabled")
+        self.sequence_panel.set_connected(False)
+        self.conditioning_controls.set_servo_enabled(False)
         self.servo_status_var.set("Servo: —")
 
     def _on_disable(self):
@@ -1290,6 +1303,7 @@ class App:
             or str(self.pvt_fire_button["state"]) == "normal"
             or str(self.current_profile_fire_button["state"]) == "normal"
             or str(self.simple_ol_fire_button["state"]) == "normal"
+            or str(self.sequence_panel.fire_button["state"]) == "normal"
         )
         try:
             self.controller.abort()
@@ -1311,6 +1325,7 @@ class App:
         # any other mode. _poll deliberately does NOT re-clear it, since
         # this mode runs with the servo off by design.
         self.simple_ol_fire_button.config(state="disabled")
+        self.sequence_panel.on_disable()
         if was_armed:
             self.status_var.set("Arm sequence aborted")
 
@@ -3593,6 +3608,8 @@ class App:
         self.contour_arm_button.config(state="normal" if servo_enabled else "disabled")
         self.pvt_arm_button.config(state="normal" if servo_enabled else "disabled")
         self.current_profile_arm_button.config(state="normal" if servo_enabled else "disabled")
+        self.sequence_panel.set_servo_enabled(servo_enabled)
+        self.conditioning_controls.set_servo_enabled(servo_enabled)
         # Fire is only ever force-disabled here, never force-enabled --
         # only a successful Arm does that. This makes Disable the master
         # abort for an armed impact: Fire grays out the instant the servo

@@ -54,6 +54,7 @@ from controller.controller import (
     FULL_STROKE_MM,
     SLOW_ACCEL_M_S2,
     SLOW_DECEL_M_S2,
+    SLOW_RETRACT_MARGIN_MM,
     SLOW_SPEED_M_S,
 )
 from program.conditioning_program import MODE2_PULSE_CURRENT_A, MODE2_PULSE_MS
@@ -129,7 +130,9 @@ def default_profile() -> dict:
                 "speed_m_s": SLOW_SPEED_M_S,
                 "accel_m_s2": SLOW_ACCEL_M_S2,
                 "decel_m_s2": SLOW_DECEL_M_S2,
-                "target_mm": 0.0,
+                # Same 2mm inset the Slow Retract button uses -- the coil
+                # can't reliably hold right at the retract limit.
+                "target_mm": SLOW_RETRACT_MARGIN_MM,
             },
             "recording": {"circular": True},
             "disable_at_end": True,

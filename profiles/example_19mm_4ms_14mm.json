@@ -1,0 +1,89 @@
+{
+  "format": "cci-impact-profile",
+  "version": 1,
+  "name": "example_19mm_4ms_14mm",
+  "tip": "19 mm",
+  "notes": "EXAMPLE ONLY - trajectory/feedforward numbers copied from the Sept 2026 testing-GUI captures (docs/images/image7.png); hold current, retract and conditioning settings are untested defaults. Re-tune and re-save from the testing GUI before use.",
+  "created": "2026-10-13T06:19:38",
+  "impact_velocity_m_s": 4.0,
+  "impact_depth_mm": 14.0,
+  "motion": {
+    "mode": "current_profile_sequence",
+    "start_mm": 0.0,
+    "stop_mm": 39.74,
+    "impact_position_mm": 25.74,
+    "peak_velocity_position_mm": 27.74,
+    "mass_kg": 0.007,
+    "kf_accel": 1.0,
+    "kf_decel": 0.6,
+    "ff_stretch": {
+      "accel_rise": 2.8,
+      "accel_fall": 0.4,
+      "decel_rise": 0.4,
+      "decel_fall": 0.4
+    },
+    "ff_advance_us": 3000.0,
+    "pre_pause_ms": 2,
+    "post_pause_ms": 2,
+    "motion_pid": {
+      "kp": 0.0,
+      "kd": 0.0,
+      "ki": 0.0,
+      "offset_v": 0.0
+    },
+    "rest_pid": {
+      "kp": 0.1,
+      "kd": 0.1,
+      "ki": 0.002,
+      "offset_v": 0.04
+    }
+  },
+  "sequence": {
+    "condition": {
+      "enabled": true,
+      "current_a": 10.0,
+      "duration_ms": 20.0,
+      "settle_ms": 50.0,
+      "position_mm": 0.0
+    },
+    "dwell": {
+      "duration_ms": 200.0,
+      "hold_current_a": 2.0,
+      "hold_servo": false,
+      "fast_tail_ms": 20.0
+    },
+    "retract": {
+      "kick_current_a": 0.0,
+      "kick_ms": 0.0,
+      "pid": {
+        "kp": 0.1,
+        "kd": 0.1,
+        "ki": 0.002,
+        "offset_v": 0.04
+      },
+      "speed_m_s": 0.1,
+      "accel_m_s2": 0.2,
+      "decel_m_s2": 0.2,
+      "target_mm": 2.0
+    },
+    "recording": {
+      "circular": true
+    },
+    "disable_at_end": true
+  },
+  "amp": {
+    "full_scale_current_a": 36.0
+  },
+  "calibration": {
+    "points": [
+      [
+        26411.008,
+        0.0
+      ],
+      [
+        -12779.52,
+        39.85
+      ]
+    ]
+  }
+}
