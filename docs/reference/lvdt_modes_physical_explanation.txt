@@ -1,0 +1,55 @@
+The one idea everything rests on
+
+The voice coil and the LVDT share magnetic material. The LVDT measures position by how well its AC excitation couples through that material, and that coupling depends on the slope of the material's magnetisation curve at wherever it's currently sitting — not on how magnetised it is.
+
+That distinction is the whole thing. A ferromagnet's B–H curve is S-shaped:
+
+  B |          ______________   ← flat here (low slope)
+    |        /
+    |      /   ← steep here (high slope)
+    |    /
+----+---/------------------- H
+    |  /
+    |/______
+
+Steep in the middle, flat near the ends. Current in the voice coil moves the material along this curve. So coil current changes the LVDT's sensitivity — which is exactly what you measure: mode 0 span 12.40 V, mode 1 11.90 V, mode 2 11.60 V.
+
+Mode 2 — the pulse
+
+A ≥4.2 A pulse pushes the material all the way out to the flat part of the curve (saturation). When the current stops, it does not slide back to the middle — ferromagnets have memory, so it stays out near the flat end, at what's called the remanent point.
+
+The LVDT now measures a flat part of the curve. Low slope, weak coupling, smallest span.
+
+And this is why polarity doesn't matter: +5 A and −5 A leave you at opposite ends of the curve, but both ends are equally flat. The slope is the same. Sign-independence falls straight out.
+
+Mode 1 — the dither
+
+The amp's PWM ripple is a small symmetric AC current, roughly ±0.5–1 A (estimated — you haven't measured it). A symmetric AC field applied repeatedly walks the material down a shrinking spiral of smaller and smaller loops back toward the middle of the curve. That's literally how a degausser works.
+
+Middle of the curve = steep slope = stronger coupling = larger span.
+
+Crucially, a degausser can only erase what its own amplitude can reach. ~1 A of ripple cannot undo a state created by 5 A — which is exactly what your threshold test shows, and why mode 2 is stable while the amp sits there ripple-ing away at it.
+
+Why only two modes
+
+This is the part I find most satisfying, because it isn't an assumption — it falls out of the above.
+
+The dither is an attractor. Anything within its reach gets pulled to the centre of the curve. Anything beyond its reach is left exactly where it is. So there are only two places the material can end up:
+
+- pushed past ~4.2 A → parked at the flat end, out of the dither's reach → mode 2
+- anything less → dragged back to the centre by the ripple → mode 1
+
+Intermediate states aren't stable. If you partially magnetise it, the ripple either erases it completely or can't touch it at all. There's no middle ground to sit in — which is why you see two discrete states rather than a continuum, and why there's a narrow probabilistic band right at the boundary (your 4 A, 2/5).
+
+Why mode 0 appears when the amp is disabled
+
+Two things change when you disable the amp, and the second is the important one:
+
+1. The degaussing stops.
+2. The dither stops being part of the measurement.
+
+While the ripple is present, the material is continuously swinging around a sizeable loop, and the LVDT sees the average slope across that loop. Take the ripple away and the LVDT's own tiny excitation only makes a microscopic excursion, which samples the much steeper local slope. Bigger slope, better coupling, biggest span of all — 12.40 V.
+
+So mode 0 isn't a third magnetic state. It's the same material measured a different way. And this explains the thing that looked contradictory earlier: mode 0 reads identically whether you came from mode 1 or mode 2 because the small-signal slope barely differs between the two operating points. The ripple is what makes the difference visible. Remove it and both states look the same, even though the underlying magnetisation is still different — which is why mode 2 was still there when you re-enabled.
+
+The span ordering is a good check on all of this: 12.40 (no dither) > 11.90 (dither, centre) > 11.60 (dither, saturated). Exactly the order the model requires.

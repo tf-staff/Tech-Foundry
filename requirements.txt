@@ -1,0 +1,7 @@
+# gclib is Galil's own Python binding, installed from the gclib distribution
+# (not PyPI) -- see https://www.galil.com/downloads/api. Only needed on the
+# bench machine; the test suite stubs it out.
+numpy
+scipy
+matplotlib
+pytest

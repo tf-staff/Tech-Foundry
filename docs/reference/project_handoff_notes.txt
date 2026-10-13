@@ -1,0 +1,445 @@
+PIG CCI DEVICE CONTROLLER - HANDOFF NOTES
+Last updated: 2026-10-09
+
+
+=============================================================================
+0. PROJECT GOAL AND SCOPE
+=============================================================================
+
+The device is a voice-coil-driven pig CCI (controlled cortical impact)
+instrument. Every combination of tip, impact velocity and impact depth
+requires its own calibration. Current scope is a single 19 mm tip at a
+single impact velocity of 4 m/s, across five depths: 14, 12, 10, 8 and
+6 mm. The 8 and 6 mm cases may not be achievable with acceptable rebound,
+for reasons given below.
+
+The deliverable we want are the following
+
+Finish the testing gui - add pre-impact retract, dwell (precise specified by user 100ms-1s), and
+retract. Motion strategies need to be determined for all of these. Figure out a way to record all of this
+in high resolution maybe using a rolling buffer on the galil controller. I think Galil has info or examples on this
+
+build user GUI - the operator-facing
+application that actually runs the device during an experiment. The testing
+GUI described in section 1 is largely complete and has been developed as
+needed; it is the tool we use to develop motion profiles, not the tool an
+operator will use. Once a profile has been calibrated for a given
+tip/velocity/depth combination it will be handed to the user GUI, most
+likely as a config file.
+
+Integrate motion from testing gui into user gui via config files that are created by testing gui and read by user gui
+
+Important NOTES
+A lot of this document is written by AI, it may not all be correct
+Lots of resources are included in the directory that this document is in, please look at them and use as needed.
+We may also independently modify the testing gui in parallel so make the integration modular if we decide to use our motion program instead in the final user gui 
+There is a sketch of a gui design in this folder, feel free to amend it as you see fit
+Please write a summary of what you did, including things you weren't sure about
+
+
+
+MOTION REQUIREMENTS
+
+Two quantities must be both repeatable and accurate: impact velocity at the
+point of impact, and impact depth.
+
+The impact point sits at full extension minus the impact depth. Full
+extension is roughly 40 mm, so a 14 mm depth means impact occurs at about
+26 mm of travel and the actuator then continues the remaining 14 mm to the
+full-extension hard stop. Depth is therefore set mechanically by the hard
+stop rather than by servo control. This is deliberate: bringing 4 m/s to a
+halt within roughly 10 mm of travel is very difficult to do repeatably, so
+we let the hard stop define the depth instead of trying to stop at a
+commanded position.
+
+The complication is rebound. The tip must not bounce off the hard stop, so
+we want to dissipate as much energy as possible electrically through the
+voice coil during penetration. The shallower the depth, the less travel is
+available to absorb that energy - which is why 8 and 6 mm may not be
+achievable with acceptable rebound.
+
+
+APPROACH AND OPEN QUESTIONS
+
+The planned method is a custom open-loop feedforward current profile. It has
+worked better than anything else we have tried (see section 3).
+
+Still unresolved:
+
+  - The pre-retract mechanism, including whether it should deliberately
+    drive the LVDT into mode 2 (see section 4).
+  - The hold strategy at full extension.
+  - The post-retract motion strategy.
+  - How to record the complete motion given the Galil's recording
+    limitations (see section 2).
+
+
+=============================================================================
+1. THE TESTING GUI: WHAT IT DOES, HOW IT WORKS, ARCHITECTURE
+=============================================================================
+
+The GUI is a single-window Tkinter application that serves as the operator
+console for the whole rig. It connects to a Galil DMC-31011 motion
+controller over Ethernet through Galil's gclib Python bindings. From one
+window the operator can connect/disconnect, enable and disable the servo,
+calibrate the LVDT, set every motion parameter, arm a test, fire it, and
+view the resulting capture. There is no separate configuration file or
+command line workflow; everything is entered in the window and nothing is
+persisted between sessions except what is hard-coded as a default.
+
+A background poll runs about five times a second while connected. It reads
+raw position counts, converts to millimetres, reads the LVDT voltage
+directly, reads the amplifier output command, and reads servo on/off state.
+Those values drive the live readout and also gate the buttons: most motion
+controls only become available when the servo is actually enabled, and Fire
+only becomes available after a successful Arm. Pressing Disable at any time
+is the master abort - it drops the servo and immediately greys out Fire.
+
+The central design decision is that nothing time-critical runs on the host.
+An impact event is roughly 60 to 80 milliseconds and needs deterministic
+timing at the sub-millisecond level, which a Windows laptop talking over
+Ethernet cannot provide. So the host never sequences a move. Instead, Arm
+generates a complete DMC program as text, downloads it to the controller
+along with any data arrays it needs, and applies the gain settings. Fire
+then does nothing more than execute that program and wait. When the program
+finishes, the host uploads the recorded arrays and plots them. The host is
+a setup and readback tool; the controller is what actually runs the test.
+
+The code is organised in four layers. src/gui/app.py holds the GUI and most
+of the application logic: the fields, all client-side validation, the
+Arm/Fire sequencing for each mode, and the handoff to plotting. It is around
+3,500 lines and is the largest single file in the project.
+src/controller/controller.py is the only module that talks to hardware. It
+wraps gclib, and it also owns all unit conversion and the LVDT calibration
+state. That state lives at class level rather than on an instance, because
+conversions are called as bare Controller.foo(...) from all over the
+application and need to see the same calibration everywhere.
+
+src/program/ contains the DMC program builders, one module per motion mode,
+plus current_profile_trajectory.py for the trajectory mathematics. These are
+deliberately pure: they take numbers and return program text or lists of
+values, with no Tkinter and no gclib anywhere. That means the entire
+trajectory and program-generation path can be unit tested on any machine
+with no controller attached, which has mattered a great deal because bench
+time is limited and the controller is often not available.
+src/analysis/capture_analysis.py builds the matplotlib figure for a capture
+and is similarly independent of both the GUI and the hardware.
+src/gui/app_basic.py is a stripped-down fallback GUI kept working as an
+insurance policy; it only uses the simplest parts of Controller.
+
+Captures are written to captures/ as timestamped PNGs and also opened in an
+interactive window. The plot overlays every recorded channel on a shared
+time axis, with each major quantity on its own auto-scaled Y axis, check
+boxes to toggle traces, and sliders that re-tune the Savitzky-Golay
+parameters used to derive velocity. The parameters that produced the capture
+are rendered onto the figure itself, so a saved PNG is self-documenting.
+
+Several motion modes exist in the GUI for historical and diagnostic reasons
+- closed loop, open loop voltage, contoured, PVT, current profile, and a
+simple single-pulse mode built purely as instrumentation. For the final
+project only the current profile (feedforward current) mode matters. The
+others are kept because they are useful for setup and troubleshooting, but
+they are not part of the delivered test method and should not be treated as
+things that need to be maintained to the same standard.
+
+
+=============================================================================
+2. DATA RECORDING AND ITS LIMITATIONS
+=============================================================================
+
+Recording uses the Galil's built-in record facility rather than any host-
+side sampling. The pattern is: DM to dimension the arrays, RA to list which
+arrays are being recorded into, RD to name which controller operands feed
+them, RC 1 to start, and RC 0 to stop. For a program-driven test the RC 1
+and RC 0 are lines inside the downloaded DMC program, so recording starts
+and stops at exactly defined points in the sequence rather than whenever the
+host happens to send a command.
+
+Four channels are recorded simultaneously. _TPA is actual position, which on
+this rig is the LVDT reading via the controller's analog feedback input.
+_RPA is the commanded or reference position that the position loop is
+chasing. _TEA is the following error. _TTA is the output command the
+controller is sending to the amplifier. Recording captures one sample per
+servo cycle, so the sample period is whatever TM is set to for that capture.
+Current profile mode fixes TM at a requested 125 microseconds; the
+bench-measured actual period is about 122 microseconds, and all of that
+mode's internal timing maths uses the measured value rather than the
+requested one.
+
+After the program completes, the host queries MG _RD for the number of
+samples actually recorded, then uploads each array with GArrayUpload. From
+there everything is host-side: counts are converted to millimetres through
+the LVDT calibration, _TTA is converted to volts and then to amps, and
+velocity is derived.
+
+The first and most restrictive limitation is the array table. The controller
+has a hard total of 3000 array elements. Four recording channels at 750
+elements each is exactly 3000, which is the entire budget with no slack at
+all. Any mode that needs an additional array must shrink its own recording
+arrays to make room. Current profile mode does exactly this: it computes the
+number of samples its specific move actually needs, sizes the recording
+arrays to that instead of the shared default, and refuses to arm if four
+times that number plus the feedforward array length would exceed 3000.
+
+The second limitation follows from the first. At roughly 122 microseconds
+per sample, 750 samples is about 91 milliseconds of capture per channel, and
+less once the recording arrays are shrunk to make room for feedforward data.
+The recording window spans the pre-move pause and the post-move pause as
+well as the move itself, so those pauses must be kept small in this mode.
+A move near the top of the 60 to 80 millisecond target range runs close to
+the edge of what can be recorded.
+
+Third, recording is non-circular. RC 1 fills the array once and stops. If
+the move runs longer than the recording was sized for, the tail is silently
+cropped with no error. This is not hypothetical - it was observed as
+feedforward current appearing to be cut off past the end of the recording,
+and the fix was to make the sizing calculation account for whichever of the
+two concurrent threads runs longer, not just the position move.
+
+Fourth, there is a controller quirk around array allocation that cost
+significant bench time. Growing an array that has already been dimensioned
+does not reliably work; it can silently keep the old smaller size, or fail
+with "array space full" even when space should be available. Per-array
+deallocation leaks space across repeated cycles. The reliable pattern, and
+what the code now does, is to deallocate the entire array table and then
+create all arrays fresh. Anyone changing array sizing needs to know this or
+they will reintroduce a very confusing class of bug.
+
+Fifth, and most important to understand when reading any capture: current is
+not measured. The Current trace on every plot is derived from _TTA, which is
+the command the controller is sending, scaled by a constant that the
+operator must manually keep in sync with the amplifier's analog input scale
+setting in CME. There is no current feedback anywhere in the system. If the
+amplifier faults, saturates, hits its voltage compliance limit, or is simply
+scaled differently than the GUI believes, the plot looks completely normal.
+We have been caught by this twice. Adding a real current measurement, by
+wiring the amplifier's current monitor output into the controller's second
+analog input, is the single highest-value instrumentation improvement
+available.
+
+Sixth, velocity is not recorded either. It is computed host-side by
+Savitzky-Golay differentiation of the position channel, with the window
+length and polynomial order adjustable from the plot window. This means
+velocity inherits all of the LVDT's noise and, more significantly, any
+artifact in the position signal. A position error that looks small can
+become a large apparent velocity spike after differentiation. This is
+directly relevant to the LVDT behaviour described in section 4.
+
+Finally, the whole scheme is one-shot. There is no streaming and no use of
+the circular recording mode. One Fire produces one capture, and the capture
+must be uploaded before the next run.
+
+
+=============================================================================
+3. FEEDFORWARD CURRENT MODE: HOW IT WORKS AND WHY WE CHOSE IT
+=============================================================================
+
+Feedforward current mode runs two concurrent threads on the controller.
+Thread 0 performs a Contour Mode position move: a jerk-limited trajectory is
+sampled into a series of position increments, which are fed out as CD lines
+at a fixed 250 microsecond spacing, with the position PID active. Thread 1
+independently plays a precomputed array of voltage values into OF, the
+amplifier command offset, paced at 500 microseconds per update. Thread 1
+owns OF exclusively for the duration of the move; thread 0 does not touch it
+again until teardown, and teardown explicitly waits for both threads to
+finish before changing any timing or gain settings.
+
+The two threads sum at the amplifier input. The feedforward array supplies
+the bulk of the current required to execute the move, and the position loop
+supplies only a small residual correction on top of it. This is the whole
+point of the arrangement: the actuator is told in advance what current the
+move requires, rather than the position loop having to discover it from
+accumulated error.
+
+The feedforward values come from the trajectory itself. The move is a
+two-phase quintic, or minimum-jerk, curve: zero velocity at the start,
+ramping up to a peak velocity at a specified position, then ramping back
+down to zero velocity at the end, with acceleration pinned to exactly zero
+at all three of those points. Because acceleration is continuous
+everywhere, the current derived from it is continuous too, with no
+instantaneous steps of the kind a constant-acceleration trapezoid would
+produce. The conversion is simply FF(t) = -m * a(t) / Kf, sampled on the
+feedforward thread's own time grid, clamped to the controller's documented
+OF range, and downloaded as an array before the program runs.
+
+
+HOW THE TRAJECTORY GETS ONTO THE CONTROLLER
+
+All of the trajectory mathematics runs on the host, before anything is sent
+to the Galil. The curve is solved in physical units - millimetres and metres
+per second squared - with no reference to encoder counts or controller
+syntax. Solving it is a numerical step, because peak velocity is not given
+directly: it is the one unknown pinned by the requirement that the
+deceleration quintic pass through the specified impact velocity at the
+specified impact position.
+
+Once the curve exists, it is sampled twice at two different rates, both
+drawn from the same underlying solution. Position is sampled on the Contour
+Mode grid, one point every two servo cycles, and converted to encoder counts
+through the LVDT calibration, then differenced into the relative increments
+Contour Mode actually consumes. Acceleration is sampled separately on the
+feedforward thread's slower grid, one point every four servo cycles, and
+converted to volts through FF(t) = -m * a(t) / Kf. Both use the bench-
+measured servo period of about 122 microseconds rather than the 125
+microseconds nominally requested, because the discrepancy is large enough to
+matter over a move of this length. A third, finer resample at the raw servo
+period is also computed, used only to overlay the intended feedforward curve
+on the capture plot at the recording's own sample spacing.
+
+The two halves then reach the controller by different routes. The position
+increments are written directly into the generated program text as literal
+CD lines, so they travel with the program download. The feedforward values
+are too numerous to embed that way and are instead downloaded as a named
+array through gclib's array download, which issues the DMC QD command
+underneath. The program is downloaded first, then the recording arrays are
+sized to this specific move, then the feedforward array is downloaded last.
+Order matters here: QD suspends data record output until the transfer
+finishes, so an array download must never overlap a move or an active
+recording.
+
+Two wire-format problems were found on the bench and are handled in the
+download path. Values small enough that Python renders them in scientific
+notation come back corrupted, because QD's format does not parse an
+exponent; and a floating-point residual that lands on the negative side of
+zero is rejected outright as a number out of range, since it is transmitted
+as the literal text "-0.0". Both occur naturally in a feedforward array at
+the sign change between acceleration and deceleration. Every value is
+therefore rounded to six decimal places and has zero added to it before
+download, which collapses both cases to a plain zero without affecting any
+real value.
+
+Arming therefore does all of the work: validate the inputs, solve the curve,
+sample both grids, generate the program text, download the program, size the
+recording arrays, download the feedforward array, and apply the gain
+settings. Firing only executes what is already resident.
+
+Two refinements were added from bench observation. First, separate force
+constants are used for the acceleration and deceleration phases, because the
+actuator's real force constant differs measurably between the two current
+directions and a single value did not track output in both phases. Second,
+there are four independent time-stretch controls that reshape the
+feedforward curve without touching the commanded position at all, plus a
+Feedforward Advance setting that pads the start of the move with
+zero-increment contour segments so the current begins ramping before
+physical motion starts. Both were responses to the actual velocity profile
+coming out narrower and later than the commanded one at high impact speeds.
+
+The impact point is handled as a waypoint rather than as a phase boundary.
+Instead of treating impact as the end of acceleration, the single continuous
+deceleration quintic is solved numerically so that it passes through the
+required velocity at the required position partway down. This lets
+deceleration begin before impact and continue after it, spreading the decel
+over a longer span than the impact-to-end distance alone would allow. That
+matters because decelerating over just impact-to-end saturates the available
+current at high impact velocities.
+
+As to why this mode was selected over the alternatives: the original open
+loop voltage mode has no position control at all. The operator dials in a
+sequence of voltages and durations and hopes the resulting motion is right,
+with no correction for friction, gravity load, or actuator variation.
+Repeatability was poor and every change to the target conditions meant
+re-tuning by hand.
+
+The pure position-loop modes - closed loop, contoured, and PVT - have the
+opposite problem. The position loop can only command current in response to
+error that has already occurred. At the velocities and accelerations this
+rig needs, following error becomes large, the loop is permanently chasing
+rather than leading, and the current it produces arrives late. Raising gains
+far enough to fix that makes the system unstable and noisy.
+
+Feedforward current is the combination that actually matches the physics.
+Current produces force, force produces acceleration, and acceleration is the
+quantity the trajectory specifies. Computing the current from the planned
+acceleration means the actuator is commanded to do the right thing from the
+outset, while leaving the position loop in the circuit to correct whatever
+the model gets wrong. The jerk-limited trajectory keeps the commanded
+current smooth and bounded, and the waypoint treatment of impact keeps the
+required current within what the amplifier can actually deliver. It gives us
+repeatable control of impact velocity, which is the parameter the project
+exists to control, without running fully open loop.
+
+
+=============================================================================
+4. LVDT MODES AND THE PLAN FOR DEALING WITH THEM
+=============================================================================
+
+The LVDT has two stable magnetic states, and current through the voice coil
+switches between them. We have been calling them mode 1 and mode 2. They
+differ in the sensor's sensitivity: measured end-to-end, mode 1 spans 11.90
+volts across the stroke and mode 2 spans 11.60 volts, a difference of about
+2.5 percent. There is a third reading, around 12.40 volts, that appears when
+the amplifier is disabled, but that is a measurement artifact rather than a
+third state - it is the same material measured without the amplifier's PWM
+ripple superimposed, and it reads identically regardless of which of the two
+real states the sensor is actually in.
+
+The practical consequence is a calibration error that is strongly
+asymmetric. If the rig is calibrated in mode 1 and then run in mode 2, full
+retract reads about 1.34 mm when it is actually at zero, while full extend
+reads only about 0.33 mm high. That four-to-one asymmetry between the two
+ends of travel is the drift we had been chasing for weeks and had
+provisionally attributed to the LVDT being undersized for the stroke. The
+undersizing is real and contributes a genuine nonlinearity near full
+retract, but it is not the explanation for the run-to-run jumps.
+
+The physical picture is that the voice coil and the LVDT share magnetic
+material, and the sensor's output depends on the slope of that material's
+magnetisation curve. A large current pulse drives the material into
+saturation and leaves it on the flat part of the curve, where coupling is
+weaker and the span is smaller. Polarity is irrelevant, because both ends of
+the curve are equally flat; this was confirmed repeatedly with pulses of
+both signs. The threshold is sharp. At full retract, pulses of 1 to 3 amps
+never caused a transition in five attempts each, 4 amps caused one in about
+70 percent of attempts, and 5 amps caused one every time. Near full extend
+the threshold is higher and 10 amps is needed reliably, consistent with the
+weaker coupling at that end.
+
+There is also a second, reversible effect. Current flowing at the moment of
+measurement shifts the sensor's null, by roughly 0.42 mm per 0.3 amps at
+full retract, and it springs back when the current stops. This is separate
+from the two-state behaviour and is not yet corrected for anywhere. It is
+the most likely explanation for the spurious velocity spike seen at the
+start of impact captures, since the apparent position shifts as the current
+ramps and differentiation turns that into a large false velocity.
+
+The immediate plan is to stop letting the sensor state drift and instead set
+it deliberately. Two procedures have been validated at both ends of travel.
+A single 10 amp, 20 millisecond pulse puts the sensor in mode 2 reliably,
+five times out of five. A 2 amp, 20 millisecond pulse restores mode 1 about
+four times out of five, so repeating it three times gives roughly 99 percent
+reliability. Neither requires a power cycle. The key operational point is
+that impacts run at 10 amps and above, which means every impact puts the
+sensor into mode 2 regardless of what we do. Calibration must therefore be
+taken in mode 2, which means conditioning with a 10 amp pulse immediately
+before calibrating rather than calibrating straight after enabling the
+servo, since enabling tends to leave the sensor in mode 1.
+
+The current plan is to stop there rather than compensate for the sensor's
+behaviour in software. Provided it is always conditioned to mode 2 and
+always read in mode 2, a single two-point calibration taken in that state is
+self-consistent, and we expect the residual nonlinearity to be acceptable
+for what we need to measure. On the same basis we intend to accept the
+reversible null shift rather than correct for it, on the assumption that it
+does not materially affect impact velocity.
+
+That second assumption is worth recording explicitly so it can be rechecked
+if velocity accuracy is ever in question. The reversible shift tracks
+instantaneous current, so it only corrupts a velocity measurement where the
+current is changing. If the current happens to be flat through the impact
+point itself, the effect on measured impact velocity is small even though
+the shift during the acceleration ramp is not.
+
+A piecewise LVDT calibration was written to handle this a different way,
+allowing up to four calibration points and three linear regions so the
+nonlinearity near full retract could be captured rather than averaged away.
+It passes its own tests but has never been validated on hardware, and under
+the plan above it is not needed. It can be left dormant or removed. The
+two-point calibration it replaced remains the fallback, and the manual
+voltage entry added alongside it is useful regardless.
+
+What does remain is procedural. The sensor must be conditioned to mode 2
+before calibrating and before each run, and those conditioning pulses should
+be built into the software so the state is set automatically as part of
+arming rather than as a manual step an operator can forget.
+
+

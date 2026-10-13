@@ -1,0 +1,12 @@
+Yep, that's it. Good find. I don't think I have a brake on the voice coil. It's good to know this limitation. Is it possible to upload multiple programs onto the controller then run one specific one? I'm mostly planning for the ultimate imlementation at this point. Or alternatively preload a program and load variables without disabling the servo?
+
+Yes — and they're really the same underlying capability. Two things from the manual make this work:
+
+1. One download can hold multiple named routines. A DMC-30000 program is just labeled blocks (#IMPACT ... EN, #CONTOUR ... EN, #HOME ... EN, etc.) all coexisting in the same download. XQ #label starts execution at whichever one you want, and nothing about XQ triggers the servo-disable warning — that's specific to DL (download), not to running an already-resident routine.
+2. Variables and arrays live outside program text memory, so setting them doesn't require a DL either. Scalar params (voltage, wait times, impact velocity) can be plain name=value commands; the recording feature already proves this pattern — DM/GArrayDownload writes array data without ever touching program memory.
+
+So the "ultimate implementation" is: download the combined multi-routine program once (at connect, or once per session), then for each Arm just push updated variables/array data and XQ the right label — no re-download, no 300ms servo blip, ever, after the initial load.
+
+The one real wrinkle: Open Loop Motion's params (voltage, wait times) are cheap scalars, trivial to vary this way. Contoured Motion's trajectory is currently baked in as one literal CD line per point — that's fine for a one-time download but not for "vary the shape without re-downloading." Getting Contoured Motion onto this model means switching it to the array-download approach I'd originally considered (push the point array via GArrayDownload, have the resident routine loop through it via an index variable) rather than literal inline CD lines. Also worth keeping in mind: all preloaded routines share one 80-char × 1000-line memory budget, so it's worth being deliberate about how much headroom Contoured Motion's point count leaves for everything else.
+
+Happy to sketch a concrete plan for this whenever you want to move on it — just flagging it's a real restructure of contour_program.py/impact_program.py/the Arm flow, not a small tweak.

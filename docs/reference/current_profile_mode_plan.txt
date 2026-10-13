@@ -1,0 +1,367 @@
+ Current Profile Motion Mode
+
+ Context
+
+ Contour and PVT Motion both currently rely entirely on the position-loop
+ PID to track a fast (~60-80ms), high-acceleration impact profile through
+ position error alone. That limits achievable tracking bandwidth. The fix
+ is to offload most of the effort onto a precomputed feedforward
+ current/voltage curve -- derived from a smooth, jerk-limited (S-curve)
+ trajectory's acceleration via FF(t) = m*a_cmd(t)/Kf -- played back once
+ per servo tick into the OF (Offset) register on the controller itself,
+ synchronized with a Contour Mode position move, so the feedforward term
+ and the PID's small residual trim sum automatically at the amplifier
+ input. This is a genuinely new pattern for this codebase (host-to-
+ controller array download, and a real-time per-tick onboard loop) with
+ one specific, isolable engineering risk: whether an interpreted DMC
+ program can read an array element and write OF within a single servo
+ period (125-250us) without falling behind. That risk must be bench-
+ validated first, in isolation, before the rest of the architecture is
+ built on top of it.
+
+ Per your answers: the first version targets Contour Mode (not PVT)
+ for the position transport -- simpler CD position-only interpolation,
+ higher segment budget (500 vs 126), one less variable while the timing
+ risk is being validated. Mass and force-constant (Kf) are GUI input
+ fields you'll determine externally (datasheet/manual bench test), not
+ something this plan builds characterization tooling for.
+
+ Research findings grounding this plan
+
+ - No GArrayDownload/host-to-controller array write exists anywhere in
+   src/ today -- recording (start_recording/upload_recorded_data,
+   controller.py:365-406) only uploads controller-to-host via
+   GArrayUpload. The Galil-side command is QD (firmware command
+   reference, "Download Array"), with gclib's GArrayDownload as the
+   intended host wrapper. Caveat: QD pauses Data Record output
+   until it completes, so the FF array must be downloaded before RC 1
+   starts recording, not during a move.
+ - OF (firmware reference, OFm=n) is a plain scalar bias-voltage
+   command, range +/-9.9982V, currently only ever sent as a single static
+   value per phase (Controller.set_offset, and literal OF <value>
+   lines in impact_program.py/contour_program.py/pvt_program.py) --
+   never updated in a loop today.
+ - No WA command exists; DMC array element access is plain assignment
+   syntax (arr[i]=value / value=arr[i]).
+ - Manual benchmark (DMC-30000 manual, Ch.7 "General Program Flow and
+   Timing"): a trivial i=i+1 / JP#loop,i<1000 loop measured ~82-84us per
+   iteration (with REM comments, which cost nothing at runtime, vs NO/
+   ' comments, which do). That alone is a large fraction of a 125us
+   budget before adding an array read and an OF write -- 250us is the
+   more realistic starting target, but this needs real bench confirmation
+   with the actual loop body, not just this simpler reference example.
+ - AT (After Time) is the documented mechanism for pinning a loop's
+   iteration rate to the servo clock regardless of loop-body variance
+   (AT0 sets a reference, AT -n,1 blocks until n samples have elapsed
+   and advances the reference -- the negative form is required for a
+   repeating per-iteration wait; a positive AT n,1 only ever waits once,
+   against the original reference, bench-confirmed). It can only slow a
+   naturally-faster loop down to match a target rate; it cannot rescue a
+   loop body that itself exceeds one TM period.
+ - Bench-confirmed (Phase 0, src/headless/ff_loop_timing_bench.py):
+   AT's n0 argument has a documented Resolution of 2 (firmware reference
+   Arguments table) -- only even sample counts are a valid step, and
+   requesting an odd count (AT -1,1) was confirmed to silently behave as
+   2 samples anyway (ratio~1.96 at both TM=500us and TM=1000us against a
+   1-sample prediction, ruling out a TM/AT coupling bug; AT -2,1
+   explicit against a doubled prediction landed at ratio~0.985). This
+   means the real achievable per-update cadence for this whole
+   architecture is 2TM, not 1TM -- e.g. at TM=250us, OF can only
+   be updated every 500us, not every 250us. Every program this feature
+   builds must request 2 samples per AT wait, and Phase 2's trajectory
+   sampling / FF array should be generated at the 2*TM cadence, not TM
+   itself.
+ - TM range: 125us min, 1000us default (both manuals agree). Note:
+   controller.py's TM_MAX_US = 20000 comment claims "20000usec per
+   spec" for this DMC-31011, but the firmware reference PDF's TM entry
+   documents a 5000us max -- a discrepancy, unrelated to this feature
+   (only the fast/low end matters here), flagged for separate follow-up.
+ - .claude/reference/program_download_plan.txt (a prior planning
+   discussion, not code) already identified this general direction --
+   "push the point array via GArrayDownload, have the resident routine
+   loop through it via an index variable" -- as the eventual model for
+   varying a trajectory without a full program re-download, though it was
+   never implemented. Current Profile mode is the first real use of that
+   idea, though scoped to just its own array, not a Contour/PVT-wide
+   refactor.
+ - Existing per-mode GUI/Arm/Fire pattern (traced in full via
+   _on_arm_contour/_on_fire_contour, app.py:1642-1887) is the
+   template to mirror: StringVars -> parse/validate on Arm -> build
+   program text -> download_program -> slow-retract -> _format_motion_ info snapshot -> Fire runs the program, waits via wait_for_program_ complete, retrieves the capture via upload_recorded_data(), calls
+   _show_capture. Button gating (_poll, app.py:2410-2451, and
+   _on_disable's force-disable, app.py:928-954) is shared
+   infrastructure needing no changes -- just add the new buttons to the
+   lists it already iterates.
+
+ Phased breakdown
+
+ Phase 1 -- Controller.download_array primitive (DONE)
+
+ New method in controller.py, mirroring the existing upload path
+ (_upload_recorded_array, which uses GArrayUpload). Implemented as:
+ def download_array(self, array_name: str, values: list) -> None:
+     values = [round(v, 6) for v in values]  # see Phase 0 finding below
+     self._g.GCommand(f"DM {array_name}[{len(values)}]")
+     self._g.GArrayDownload(array_name, 0, len(values) - 1, values)
+ The round(v, 6) is a bench-confirmed fix, not speculative: a value tiny
+ enough that Python renders it in scientific notation (e.g. a sin()
+ residual like 6.123233995736766e-17) came back corrupted on readback
+ (-6.1232) -- the DMC's QD wire format doesn't parse an e-NN
+ exponent. Rounding collapses those residuals to plain 0.0 first.
+ Verified via a no-hardware round-trip test and confirmed on the bench.
+
+ Phase 0 -- Bench-validate the array-read + OF-write loop timing (IN PROGRESS; blocking further phases)
+
+ Standalone script, src/headless/ff_loop_timing_bench.py -- not
+ integrated into the app. A staged battery (array round-trip -> bare loop
+ -> AT-throttled loop -> AT + array read -> AT + array read + OF
+ write), each stage isolating exactly one new piece, run at the coarsest
+ TM candidate (500us) first before sweeping finer.
+
+ Confirmed so far: Stage 0 (array round-trip) passes. Stage 1 (bare
+ loop) passes, ~99us/iteration, matching the manual's own benchmark and
+ validating the script's timing methodology. Stage 2 (AT-throttled
+ loop) required two rounds of bench debugging that surfaced the AT
+ resolution=2 finding written up above -- with that fix (AT -2,1,
+ predicting 2 samples/iteration), the confirming diagnostic run passed at
+ ratio~0.985. The bug-fixed default (AT_SAMPLES_PER_ITERATION = 2) is
+ now baked into every program builder in the script.
+
+ Result (bench-confirmed): Stages 0-4 all pass at TM=500us (2TM=1000us
+ cadence, ratio~0.98) and TM=250us (2TM=500us cadence, ratio~0.987).
+ TM=125us (2*TM=250us cadence) genuinely fails (ratio 1.147 -- a real
+ execution shortfall, the loop body itself can't keep up at that rate,
+ not another quirk like the earlier ones). Floor for the array-read +
+ OF-write loop, run in isolation: a 500us update cadence (TM=250us) is
+ comfortably achievable; 250us cadence (TM=125us) is not. For a
+ 60-80ms impact profile this means ~120-160 FF/position samples at the
+ achievable cadence -- well within the array-size and program-memory
+ budgets already used elsewhere in this codebase.
+
+ Optimization + finer isolated floor found after the above: switching
+ the loop body's value=arr[i]; OF value pair to a single OF arr[i]
+ line saved ~40us/iteration on the raw (no-AT) baseline. A fine TM
+ sweep (on the 31.25us quantization grid) with that optimization then
+ found TM=156.25us + AT -2,1 (312.5us cadence) as the real isolated
+ floor -- finer than the earlier 500us-cadence result. TM_US_CANDIDATES
+ in ff_loop_timing_bench.py reflects this.
+
+ Concurrent-thread validation: reopened -- isolated floor is NOT the
+ concurrent-safe floor. src/headless/concurrent_thread_bench.py
+ downloads one program with two labeled routines -- #MAIN (a real small
+ Contour Mode move, 5mm span, 0.15m/s peak, via
+ compute_contour_increments) on thread 0, #LOOP (the OF-loop) on
+ thread 1 -- launches both back to back (XQ #MAIN then XQ #LOOP,1),
+ and polls _XQ0/_XQ1 to completion.
+ - First run, TM=125us + AT -4,1 (500us cadence): PASSED, ratio
+   1.017, TC 1 clean.
+ - Re-run at the newer, finer isolated floor, TM=156.25us + AT -2,1
+   (312.5us cadence): FAILED, ratio 1.481, TC 1 clean (so a real
+   pacing shortfall, not an error) -- confirms the concern flagged from
+   the start: an idle-motor timing floor is not sufficient evidence once
+   thread 0 is actively running CD interpolation + position PID
+   concurrently, which competes for the same CPU cycles thread 1's loop
+   needs. The isolated 312.5us floor has no margin left once that
+   competing load exists.
+
+ So there are two different floors: isolated ~312.5us, concurrent
+ somewhere between 312.5us and 500us. The sweep found TM=218.75us
+ (437.5us cadence) as the finest concurrent-safe point at AT -2,1;
+ 187.5us and below failed under load.
+
+ Final decision, bench-confirmed: proceed with TM=125us + AT -4,1 (500us cadence) rather than the AT-2,1 crossover -- keeps the
+ servo loop itself fast for tight PID tracking, with more comfortable
+ margin than the 437.5us crossover point. Re-confirmed concurrently with
+ real, nonzero Motion PID gains active (KP=1, KD=1, KI=0.01, set before
+ CMA in concurrent_thread_bench.py's combined program) rather than
+ whatever gains happened to be resident -- PASSED.
+
+ Gate: PASSED. Both the isolated and concurrent-under-real-PID-load
+ cases are bench-confirmed for the chosen production combination
+ (TM=125us, AT -4,1, 500us OF-update cadence). Ready to move to
+ Phase 2. Still not covered by any bench test: the recording (RC 1/
+ DM/RA/RD) overhead the real application will also run
+ concurrently -- further CPU load not yet accounted for, worth a
+ follow-up once Phase 4's real program exists (see Phase 4's array-
+ budget note below, which touches the same recording setup).
+
+ Phase 2 -- S-curve trajectory generator (src/program/current_profile_trajectory.py, new)
+
+ Pure Python, no gclib -- same separation as contour_program.py/
+ pvt_program.py. Same inputs as the existing modes -- start_mm, impact_mm, end_mm, impact_velocity_m_s -- zero new GUI fields.
+
+ Formulation (confirmed with you): quintic minimum-jerk polynomial per
+ phase, not an explicit multi-segment jerk-limited construction. Each
+ of the two phases (start->impact, impact->end) is one smooth 5th-order
+ polynomial solved from boundary conditions position+velocity matching
+ today's trapezoid endpoints, but with acceleration pinned to exactly 0
+ at both ends of the phase -- so acceleration is continuous everywhere
+ in the move, including smoothly reversing sign through the impact point
+ (no more discontinuous accel steps at start/impact/end, which is
+ exactly the FF-curve discontinuity problem this whole feature exists to
+ fix). Duration per phase is T = 2*distance/impact_velocity_m_s -- the
+ same duration the existing constant-acceleration trapezoid already
+ implies (compute_contour_increments's own t1/t2), so the move's
+ overall timing matches Contour/PVT today; peak jerk/acceleration follow
+ implicitly from distance+velocity rather than being independently
+ tunable, and the shape is well-behaved (monotonic velocity, single-
+ humped acceleration, spot-checked numerically) for this class of
+ boundary conditions.
+
+ Per-phase math (p0/v0 -> p1/v1, zero acceleration at both ends,
+ duration T; positions in mm, but the same formulas work in any
+ consistent unit -- convert to meters first for the acceleration output):
+ dP = p1 - p0
+ dV = v1 - v0
+ A = dP - v0*T
+ B = dV
+ c3 = (10*A - 4*B*T) / T**3
+ c4 = (7*B*T - 15*A) / T**4
+ c5 = (6*A - 3*B*T) / T**5
+ p(t) = p0 + v0*t + c3*t**3 + c4*t**4 + c5*t**5
+ v(t) = v0 + 3*c3*t**2 + 4*c4*t**3 + 5*c5*t**4
+ a(t) = 6*c3*t + 12*c4*t**2 + 20*c5*t**3
+ Phase 1: p0=start_mm, p1=impact_mm, v0=0, v1=impact_velocity_m_s, T1=2*d1_m/impact_velocity_m_s (d1_m=(impact_mm-start_mm)/1000, same
+ as compute_contour_increments). Phase 2: p0=impact_mm, p1=end_mm, v0=impact_velocity_m_s, v1=0, T2=2*d2_m/impact_velocity_m_s.
+
+ API -- compute once, sample at two different rates: Phase 4 needs
+ this same underlying curve sampled at TWO different, independent rates
+ -- the CD/position array at Contour Mode's own segment spacing (DT {CONTOUR_DT_EXPONENT} = 2*TM = 250us at TM=125us), and the FF/OF
+ array at the bench-confirmed 500us cadence (AT -4,1) -- both drawn
+ from the same physical curve, not recomputed independently. So the
+ module exposes:
+ def compute_current_profile_curve(start_mm, impact_mm, end_mm, impact_velocity_m_s):
+     """Returns the two phases' (c3,c4,c5,T,p0,v0) coefficients -- pure
+     data, reusable at any sample rate."""
+
+ def sample_position_mm(curve, sample_period_s) -> list[float]
+ def sample_acceleration_m_s2(curve, sample_period_s) -> list[float]
+ mirroring compute_contour_increments's validation (`impact_velocity_m_s
+
+ ▎ 0, start_mm < impact_mm < end_mm) and raising the same ValueErrors. sample_position_mmis called once at the CD grid (its output then runs through the same mm-to-counts-increments conversion already incontour_program.py-- reuse that, don't duplicate it);sample_acceleration_m_s2` is called once at the FF grid (feeds Phase 3).
+
+ Phase 3 -- FF curve computation
+
+ ff_v[i] = mass_kg * accel_m_s2[i] / kf, clamped to OF's documented
+ range (+/-9.9982V). Confirm the Xenus XTL-230-36's Kf units/sign
+ convention at implementation time. Can live in
+ current_profile_trajectory.py or a small sibling function.
+
+ Phase 4 -- src/program/current_profile_program.py (new) -- the onboard DMC program builder
+
+ Combines, reusing existing pieces wherever possible:
+ - The same redundant-slow-retract + Motion PID setup + 6-line
+   DM/RA/RD/RC 1 recording-start block shared by
+   impact_program.py/contour_program.py/pvt_program.py. TM=125us
+   (the bench-confirmed production value -- fast servo, decoupled from
+   the FF cadence below).
+ - FF array DM + download via the new Controller.download_array, at
+   Arm time, before recording starts (Phase 1's QD caveat).
+ - A Contour Mode CD move built from Phase 2's sample_position_mm
+   (called at dt = 2*TM = 250us, matching CONTOUR_DT_EXPONENT) --
+   reuse contour_program.py's position-to-CD-increment conversion
+   directly rather than reinventing it.
+ - The bench-validated (Phase 0) OF-writing loop -- single-line
+   OF arr[i], AT -4,1 pacing (500us cadence) -- fed by Phase 2's
+   sample_acceleration_m_s2 (called at dt = 4*TM = 500us) through
+   Phase 3's FF conversion, running on a second thread (XQ#LOOP,1)
+   concurrently with the CD move on thread 0 -- a new pattern for this
+   codebase; every existing program builder here is a single-thread
+   linear sequence.
+ - Teardown: stop both threads, OF back to 0/Rest offset, reset PID/
+   sample period to Rest, disable, end -- same shape as the existing
+   programs' endings.
+
+ Array budget -- needs care at implementation time. controller.py's
+ own comments confirm the array table's bench-confirmed ceiling is 3000
+ elements total (fresh power cycle), and recording's existing 4 arrays at
+ RECORD_ARRAY_SIZE=750/channel already consume the entire budget
+ (750*4=3000) on their own -- there is no room left for a 5th (FF) array
+ without resizing something. Because each program builder dimensions its
+ own recording arrays via literal DM lines in its own program text
+ (not through the shared Controller.start_recording()/RECORD_ARRAY_SIZE
+ constant), Current Profile's program can safely use a smaller
+ recording size sized to its own actual move duration at TM=125us (a
+ ~60-80ms move needs roughly 480-640 samples/channel at one sample per
+ TM tick, not 750) -- still needs precise sizing against Phase 2's real
+ computed move duration, plus the FF array's own size (roughly 120-160
+ elements at the 500us cadence for the same move), to confirm the total
+ comfortably clears 3000. Verify this arithmetic concretely once Phase 2
+ produces real numbers, before assuming it fits.
+
+ Phase 5 -- GUI integration (src/gui/app.py)
+
+ New "Current Profile" LabelFrame after PVT Motion, mirroring Contoured
+ Motion's structure exactly (Start/Stop+Reset, Impact Velocity/Position,
+ Arm/Fire) -- no new Jerk field (Phase 2's quintic derives its own
+ timing from Impact Velocity/Position, per your confirmed choice), just
+ new Mass (kg) and Force Constant (Kf) fields. _on_arm_current_profile/_on_fire_ current_profile (+ wait-complete/wait-error) mirror _on_arm_contour/
+ _on_fire_contour (app.py:1642-1887) step for step: parse/validate ->
+ Phase 2 trajectory + Phase 3 FF curve -> Phase 4 program text ->
+ download_program + FF array download -> slow-retract -> _format_ motion_info snapshot -> Fire -> wait_for_program_complete ->
+ upload_recorded_data() -> _show_capture. Button gating needs no
+ changes -- add the new buttons to the existing _poll/_on_disable
+ lists.
+
+ Phase 6 -- Plotting (src/analysis/capture_analysis.py)
+
+ Add the FF curve as a new field, sharing "Volt Output"'s axis (both
+ volts, directly comparable) via the axis_mode sharing mechanism just
+ generalized for Cmd Velocity -- not a new own-axis field. It's host-
+ known (exactly what was downloaded, not sampled back), so no new
+ recording array needed -- thread the already-computed Phase 3 array
+ through into the _show_capture/build_capture_figure call, the same
+ way commanded_velocity_m_s is derived and passed today.
+
+ Phase 7 -- End-to-end bench validation
+
+ Real Arm/Fire cycles: confirm the onboard loop keeps pace (no stale/
+ missed OF writes) at the chosen TM, position tracking improves versus
+ the existing Contour-only baseline for the same impact profile, the FF
+ curve visually accounts for most of the Volt Output trace with PID trim
+ visibly small, and teardown is clean and repeatable across repeated
+ Arm/Fire cycles.
+
+ Files
+
+ New: src/program/current_profile_trajectory.py, src/program/ current_profile_program.py.
+ Modified: src/controller/controller.py (download_array), src/gui/ app.py (new frame/vars/Arm/Fire methods), src/analysis/ capture_analysis.py (new FF field).
+ Reference: .claude/reference/program_download_plan.txt; Galil firmware
+ command reference PDF (QD, OF, TM, AT); DMC-30000 manual Ch.7
+ "Application Programming" (loop timing benchmark, AT usage).
+
+ Verification
+
+ - Phase 0: DONE -- both isolated and concurrent-under-real-PID-load bench
+   tests passed for TM=125us + AT -4,1.
+ - Phase 2: no-hardware scratchpad tests verifying the quintic curve
+   hits its boundary conditions exactly (p/v at t=0 and t=T, a=0 at both
+   ends) and produces monotonic velocity / single-peaked acceleration for
+   a range of Start/Impact/End/Velocity combinations (mirrors this
+   session's test_pvt_fix_regression.py-style approach), plus
+   python -m py_compile.
+ - Each subsequent phase: python -m py_compile + no-hardware fake-gclib
+   scratchpad tests (this session's established pattern) for anything
+   not requiring live hardware timing.
+ - Full App() instantiation smoke test via the Pig_CCI conda env once
+   GUI changes land.
+ - Phase 7: real bench Arm/Fire validation, including confirming the
+   array-budget arithmetic (Phase 4 note above) actually holds on real
+   hardware, not just on paper.
+
+ Open items flagged, not blocking
+
+ - Kf units/sign convention (Phase 3) needs pinning down at
+   implementation time against the Xenus XTL-230-36 datasheet.
+ - Recording (RC 1/DM/RA/RD) overhead concurrent with the CD move
+   - OF loop has never been bench-tested together (Phase 0's concurrent
+     test doesn't include it) -- possible further CPU load on top of an
+     already-confirmed-tight margin; worth a targeted bench check once
+     Phase 4's real program exists, before assuming Phase 0's margin still
+     holds with recording also running.
+ - Array-table budget (3000-element ceiling vs. recording's existing
+   750/channel already using all of it) needs concrete sizing once Phase
+   2 produces real move-duration numbers -- see Phase 4 note above.
+ - TM_MAX_US discrepancy (controller.py says 20000us, firmware
+   reference PDF says 5000us) -- unrelated to this feature, worth
+   reconciling separately.

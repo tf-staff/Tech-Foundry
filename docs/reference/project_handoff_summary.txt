@@ -1,0 +1,62 @@
+PIG CCI DEVICE CONTROLLER - SUMMARY
+Companion to project_handoff_notes.txt, which has the detail
+Last updated: 2026-10-09
+
+
+The device is a voice-coil-driven pig CCI (controlled cortical impact)
+instrument. Current scope is one 19 mm tip at one impact velocity of 4 m/s,
+across five impact depths - 14, 12, 10, 8 and 6 mm - with the two shallowest
+at risk because they leave less travel in which to absorb the impact energy
+without rebounding off the hard stop. Impact depth is set mechanically
+rather than by servo control: the actuator runs all the way to a
+full-extension hard stop at about 40 mm, because bringing 4 m/s to a halt
+within roughly 10 mm of travel is not repeatable.
+
+There are three deliverables. First, finish the testing GUI by adding a
+pre-impact retract, a user-specified dwell of 100 ms to 1 s, and a
+post-impact retract, including the motion strategy for each and a way to
+record the whole sequence at high resolution, possibly using a rolling
+buffer on the Galil. Second, build the operator-facing user GUI that
+actually runs experiments. Third, connect the two, with the testing GUI
+writing config files that the user GUI reads - and that integration should
+be modular, since the testing GUI may be modified in parallel.
+
+Architecturally, a Tkinter host application talks to a Galil DMC-31011 over
+Ethernet, which commands a Copley amplifier in current mode driving the
+voice coil, with an LVDT as the only position sensor. Nothing time-critical
+runs on the host: arming generates a complete DMC program and downloads it
+with its data arrays, and firing merely executes it and reads back the
+result.
+
+The chosen motion method is an open-loop feedforward current profile, which
+has worked better than anything else tried. A jerk-limited quintic
+trajectory is solved on the host in physical units, then sampled at two
+different rates - position into contour increments embedded in the program
+text, and acceleration into a feedforward voltage array downloaded
+separately - and played back by two concurrent controller threads that sum
+at the amplifier input. It was chosen because current produces force, so
+computing current from the planned acceleration commands the right behaviour
+from the outset, while the position loop stays in the circuit only to trim
+the residual.
+
+The main constraint on all of this is recording. The controller has a hard
+3000-element array table, four recorded channels consume all of it, and at
+the impact mode's measured 122 microsecond sample period that is about 91 ms
+of capture - against a full sequence that will run to seconds once dwell and
+both retracts are included. Recording is also non-circular and crops
+silently when a move outruns it. Current is not measured anywhere, the
+current trace being the commanded value scaled by a constant the operator
+must keep in sync with the amplifier, and velocity is not recorded either
+but differentiated from position on the host.
+
+The LVDT has two stable magnetic states that differ by about 2.5 percent in
+span, switched by coil current above a sharp threshold, and this was the
+source of long-standing calibration drift. The plan is to pin the state
+rather than compensate for it in software: a 10 amp pulse reliably sets
+mode 2, every impact puts the sensor there anyway, so calibration is taken
+in mode 2 and a plain two-point calibration is treated as sufficient.
+
+The open questions are the pre-retract mechanism and whether it should
+deliberately condition the LVDT, the hold strategy at full extension, the
+post-retract strategy, and how to record the complete motion within the
+controller's limits.
