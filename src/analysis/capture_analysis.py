@@ -280,3 +280,46 @@ def build_capture_figure(
     figure._checkboxes = check
 
     return figure
+
+
+def build_sequence_figure(doc, info_text="", metrics_text=""):
+    """Whole-sequence overview for one run (a capture_io.capture_document
+    dict): position, commanded position and current for BOTH recording
+    segments on one time axis -- the fast segment drawn as a solid line,
+    the slow segment (coarser samples) as a dotted line continuing it --
+    with the dwell and retract boundaries marked. Current shares a
+    second Y-axis. Caller handles embedding/saving/displaying."""
+    fast, slow = doc["fast"], doc["slow"]
+    figure = Figure(figsize=(13, 7))
+    figure.subplots_adjust(left=0.07, right=0.78, top=0.92, bottom=0.30)
+    axes = figure.add_subplot(111)
+    axes.set_title("Impact sequence (fast segment solid, slow segment dotted)")
+    axes.set_xlabel("Time (s)")
+    axes.set_ylabel("Position (mm)", color="tab:blue")
+    axes.tick_params(axis="y", colors="tab:blue")
+    axes.plot(fast["times_s"], fast["position_mm"], color="tab:blue", label="Position (fast)")
+    axes.plot(slow["times_s"], slow["position_mm"], color="tab:blue", linestyle=":", label="Position (slow)")
+    axes.plot(fast["times_s"], fast["commanded_position_mm"], color="tab:purple", alpha=0.7, label="Cmd position (fast)")
+    axes.plot(slow["times_s"], slow["commanded_position_mm"], color="tab:purple", linestyle=":", alpha=0.7, label="Cmd position (slow)")
+    current_axes = axes.twinx()
+    current_axes.set_ylabel("Current (A)", color="tab:cyan")
+    current_axes.tick_params(axis="y", colors="tab:cyan")
+    current_axes.plot(fast["times_s"], fast["current_a"], color="tab:cyan", label="Current (fast)")
+    current_axes.plot(slow["times_s"], slow["current_a"], color="tab:cyan", linestyle=":", label="Current (slow)")
+    impact_mm = doc.get("impact_position_mm")
+    if impact_mm is not None:
+        axes.axhline(impact_mm, color="tab:red", linestyle="--", linewidth=0.8, label="Impact position")
+    for key, label, color in (
+        ("dwell_start_s", "dwell start", "tab:green"), ("retract_start_s", "retract start", "tab:orange"),
+    ):
+        t = doc.get(key)
+        if t is not None:
+            axes.axvline(t, color=color, linestyle="--", linewidth=0.8, label=label)
+    handles, labels = axes.get_legend_handles_labels()
+    h2, l2 = current_axes.get_legend_handles_labels()
+    axes.legend(handles + h2, labels + l2, loc="upper left", bbox_to_anchor=(1.08, 1.0), fontsize=8)
+    if metrics_text:
+        figure.text(0.07, 0.22, metrics_text, fontsize=10, family="monospace", va="top", ha="left")
+    if info_text:
+        figure.text(0.07, 0.14, info_text, fontsize=7, family="monospace", va="top", ha="left")
+    return figure

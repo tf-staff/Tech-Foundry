@@ -647,6 +647,39 @@ class Controller:
                 f"<{len(values)} values>) failed: {e} (TC 1: {self._describe_last_error()})"
             ) from e
 
+    def read_variable(self, name: str) -> float:
+        """Value of a controller variable (e.g. one a program stored a
+        TIME stamp or _RD into before ending) -- "MG name"."""
+        return float(self._g.GCommand(f"MG {name}"))
+
+    def read_array_space(self) -> int:
+        """Free array-table elements right now (MG _DM) -- diagnostic
+        readback for the sequence modes' array budgeting."""
+        return int(float(self._g.GCommand("MG _DM")))
+
+    def upload_array(self, array_name: str, count: int) -> list:
+        """First `count` elements of any named array (GArrayUpload). An
+        empty list for count <= 0."""
+        return self._upload_recorded_array(array_name, max(0, int(count)))
+
+    def size_arrays(self, sizes: dict) -> None:
+        """Resets the ENTIRE array table ("DA *[0]" -- see
+        size_shared_record_arrays for why nothing less is reliable) and
+        creates every array in `sizes` ({name: elements}) fresh. The
+        sequence modes use this for their fast + slow recording arrays
+        in one go; their feedforward array is then download_array()'d
+        on top, so the caller must leave room for it (the program
+        builders check the total against ARRAY_TABLE_MAX_ELEMENTS)."""
+        try:
+            self._g.GCommand("DA *[0]")
+        except gclib.GclibError as e:
+            raise gclib.GclibError(
+                f"'DA *[0]' failed: {e} (TC 1: {self._describe_last_error()})"
+            ) from e
+        self._array_sizes.clear()
+        for name, size in sizes.items():
+            self._size_array(name, int(size))
+
     def size_shared_record_arrays(self, size: int) -> None:
         """Sizes the 4 shared recording arrays (RECORD_ARRAY_NAME et al.,
         also redimensioned by every mode's own program text at Fire
